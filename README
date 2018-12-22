@@ -1,0 +1,28 @@
+WIFI Driver for Realtek 8187 and 8187B USB support
+==================================================
+
+Dependent Module : MAC80211 && USB
+
+Description :
+===========
+- Based on the r8187 driver, it under the terms of the 
+  GNU General Public License version 2. 
+- Register offsets, and phy value tables below are taken from 
+  the original r8187 driver sources. Thanks to Realtek for their support!
+- This is a modified and optimised driver for RTL8187 and RTL8187B based cards. 
+  These are USB based chips.
+- Driver is based on 4.1.X linux kernel
+
+Dovelopment stages:
+==================
+1. Complete walk throught of r8187 driver.
+2. Analysis of optimizatin scope.
+3. Rewriiting a driver as per new requirement. 
+4. Unit Testing 
+
+Status : Under development phase and untested.
+
+Feature scope : We will add this driver to embedded custom OS.      
+
+
+
