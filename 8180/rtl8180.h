@@ -1,0 +1,13 @@
+#ifndef RTL8180_H
+#define RTL8180_H
+
+#define MAX_RX_SIZE IEEE80211_MAX_RTS_THRESHOLD
+
+enum RF_PARAM {
+	 RF_PARAM_ANALOGPHY	= (1 << 0),
+	 RF_PARAM_ANTBDEFAULT	= (1 << 1),
+	 RF_PARAM_CARRIERSENSE1 = (1 << 2),
+	 RF_PARAM_CARRIERSENSE2 = (1 << 3),
+};
+
+#endif 

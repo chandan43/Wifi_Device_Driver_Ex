@@ -1,0 +1,26 @@
+#ifndef RTL8187_H
+#define RTL8187_H
+
+#include <linux/cache.h>
+
+enum RL8187_EEPROM {
+	RTL8187_EEPROM_TXPWR_BASE   = 0x05,
+	RTL8187_EEPROM_MAC_ADDR     = 0x07,
+	RTL8187_EEPROM_TXPWR_CHAN_1 = 0x16,	/* 3 channels */
+	RTL8187_EEPROM_TXPWR_CHAN_6 = 0x1B,	/* 2 channels */
+	RTL8187_EEPROM_TXPWR_CHAN_4 = 0x3D,	/* 2 channels */
+	RTL8187_EEPROM_SELECT_GPIO  = 0x3B,
+};
+
+/*USB Request : 16*/
+enum RTL8187_REQ {
+	RTL8187_REQT_READ	= 0xC0,
+	RTL8187_REQT_WRITE	= 0x40,
+	RTL8187_REQ_GET_REG	= 0x05,
+	RTL8187_REQ_SET_REG	= 0x05,
+};
+
+
+
+#endif /* RTL8187_H */
+
