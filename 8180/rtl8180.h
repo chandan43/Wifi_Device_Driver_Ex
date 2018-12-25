@@ -1,6 +1,8 @@
 #ifndef RTL8180_H
 #define RTL8180_H
 
+#include "rtl818x.h"
+
 #define MAX_RX_SIZE IEEE80211_MAX_RTS_THRESHOLD
 
 /*Device specific Reg*/
@@ -244,4 +246,3 @@ static inline void rtl818x_iowrite32(struct rtl8180_priv *priv,
 #endif /* RTL8180_H */
 
 
-#endif 
