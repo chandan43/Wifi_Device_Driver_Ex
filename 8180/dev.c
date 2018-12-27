@@ -28,6 +28,96 @@ static const struct pci_device_id rtl8180_table[] = {
 	{}
 };
 MODULE_DEVICE_TABLE(pci, rtl8180_table);
+
+/**
+ * eeprom_93cx6_read - Read a word from eeprom
+ * @eeprom: Pointer to eeprom structure
+ * @word: Word index from where we should start reading
+ * @data: target pointer where the information will have to be stored
+ *
+ * This function will read the eeprom data as host-endian word
+ * into the given data pointer.
+ */
+/**
+ * eeprom_93cx6_multiread - Read multiple words from eeprom
+ * @eeprom: Pointer to eeprom structure
+ * @word: Word index from where we should start reading
+ * @data: target pointer where the information will have to be stored
+ * @words: Number of words that should be read.
+ *
+ * This function will read all requested words from the eeprom,
+ * this is done by calling eeprom_93cx6_read() multiple times.
+ * But with the additional change that while the eeprom_93cx6_read
+ * will return host ordered bytes, this method will return little
+ * endian words.
+ */
+static void rtl8180_eeprom_read(struct rtl8180_priv *priv)
+{
+	struct eeprom_93cx6 eeprom;
+	int eeprom_cck_table_adr;
+	u16 eeprom_val;
+	int i;
+
+	eeprom.data = priv;
+	eeprom.register_read = rtl8180_eeprom_register_read; //TODO
+	eeprom.register_write = rtl8180_eeprom_register_write; //TODO
+	if (rtl818x_ioread32(priv, &priv->map->RX_CONF) & (1 << 6)) // page 23
+		eeprom.width = PCI_EEPROM_WIDTH_93C66;
+	else 
+		eeprom.width = PCI_EEPROM_WIDTH_93C46;
+
+	rtl818x_iowrite8(priv, &priv->map->EEPROM_CMD,
+			RTL818X_EEPROM_CMD_PROGRAM);
+
+	rtl818x_ioread8(priv, &priv->map->EEPROM_CMD);
+	udelay(10);
+	
+	eeprom_93cx6_read(&eeprom, 0x06, &eeprom_val);
+	eeprom_val &= 0xFF;
+	priv->rf_type = eeprom_val;
+	pr_err("%s: RF type value is %04x\n",__func__,eeprom_val);	
+	eeprom_93cx6_read(&eeprom, 0x17, &eeprom_val);
+	priv->csthreshold = eeprom_val >> 8;
+	
+	eeprom_93cx6_multiread(&eeprom, 0x7, (__le16 *)priv->mac_addr, 3);
+	
+	if (priv->chip_family == RTL818X_CHIP_FAMILY_RTL8187SE)
+		eeprom_cck_table_adr = 0x30;
+	else
+		eeprom_cck_table_adr = 0x10;
+	
+	/* CCK TX power */
+	for (i = 0; i < 14; i += 2) {
+		u16 txpwr;
+		eeprom_93cx6_read(&eeprom, eeprom_cck_table_adr + (i >> 1),
+				&txpwr);
+		priv->channels[i].hw_value = txpwr & 0xFF;
+		priv->channels[i + 1].hw_value = txpwr >> 8;
+	}
+
+	if (priv->chip_family == RTL818X_CHIP_FAMILY_RTL8180) {
+		__le32 anaparam;
+		eeprom_93cx6_multiread(&eeprom, 0xD, (__le16 *)&anaparam, 2);
+		priv->anaparam = le32_to_cpu(anaparam);
+		eeprom_93cx6_read(&eeprom, 0x19, &priv->rfparam);
+	}
+
+	if (priv->chip_family == RTL818X_CHIP_FAMILY_RTL8187SE) {
+		eeprom_93cx6_read(&eeprom, 0x3F, &eeprom_val);
+		priv->antenna_diversity_en = !!(eeprom_val & 0x100);
+		priv->antenna_diversity_default = (eeprom_val & 0xC00) == 0x400;
+
+		eeprom_93cx6_read(&eeprom, 0x7C, &eeprom_val);
+		priv->xtal_out = eeprom_val & 0xF;
+		priv->xtal_in = (eeprom_val & 0xF0) >> 4;
+		priv->xtal_cal = !!(eeprom_val & 0x1000);
+		priv->thermal_meter_val = (eeprom_val & 0xF00) >> 8;
+		priv->thermal_meter_en = !!(eeprom_val & 0x2000);
+	}
+
+	rtl818x_iowrite8(priv, &priv->map->EEPROM_CMD,
+			RTL818X_EEPROM_CMD_NORMAL);
+}
 /**
  * struct ieee80211_hw - hardware information and state
  *
@@ -133,7 +223,7 @@ static int rtl8180_probe(struct pci_dev *pdev,
 
 	pci_set_master(pdev);
 
-	dev = ieee80211_alloc_hw(sizeof(*priv), &rtl8180_ops);
+	dev = ieee80211_alloc_hw(sizeof(*priv), &rtl8180_ops);  //TODO: 
 	if (!dev) {
 		printk(KERN_ERR "%s (rtl8180): ieee80211 alloc failed\n",
 		       pci_name(pdev));
