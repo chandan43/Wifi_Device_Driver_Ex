@@ -30,6 +30,131 @@ static const struct pci_device_id rtl8180_table[] = {
 MODULE_DEVICE_TABLE(pci, rtl8180_table);
 
 /**
+ * struct ieee80211_ops - callbacks from mac80211 to the driver
+ *
+ * This structure contains various callbacks that the driver may
+ * handle or, in some cases, must handle, for example to configure
+ * the hardware to a new channel or to transmit a frame.
+ *
+ * @tx: Handler that 802.11 module calls for each transmitted frame.
+ *	skb contains the buffer starting from the IEEE 802.11 header.
+ *	The low-level driver should send the frame out based on
+ *	configuration in the TX control data. This handler should,
+ *	preferably, never fail and stop queues appropriately.
+ *	Must be atomic.
+ *
+ * @start: Called before the first netdevice attached to the hardware
+ *	is enabled. This should turn on the hardware and must turn on
+ *	frame reception (for possibly enabled monitor interfaces.)
+ *	Returns negative error codes, these may be seen in userspace,
+ *	or zero.
+ *	When the device is started it should not have a MAC address
+ *	to avoid acknowledging frames before a non-monitor device
+ *	is added.
+ *	Must be implemented and can sleep.
+ *
+ * @stop: Called after last netdevice attached to the hardware
+ *	is disabled. This should turn off the hardware (at least
+ *	it must turn off frame reception.)
+ *	May be called right after add_interface if that rejects
+ *	an interface. If you added any work onto the mac80211 workqueue
+ *	you should ensure to cancel it on this callback.
+ *	Must be implemented and can sleep.
+ * 
+ * @add_interface: Called when a netdevice attached to the hardware is
+ *	enabled. Because it is not called for monitor mode devices, @start
+ *	and @stop must be implemented.
+ *	The driver should perform any initialization it needs before
+ *	the device can be enabled. The initial configuration for the
+ *	interface is given in the conf parameter.
+ *	The callback may refuse to add an interface by returning a
+ *	negative error code (which will be seen in userspace.)
+ *	Must be implemented and can sleep.
+ *
+ * @remove_interface: Notifies a driver that an interface is going down.
+ *	The @stop callback is called after this if it is the last interface
+ *	and no monitor interfaces are present.
+ *	When all interfaces are removed, the MAC address in the hardware
+ *	must be cleared so the device no longer acknowledges packets,
+ *	the mac_addr member of the conf structure is, however, set to the
+ *	MAC address of the device going away.
+ *	Hence, this callback must be implemented. It can sleep.
+ *
+ * @config: Handler for configuration requests. IEEE 802.11 code calls this
+ *	function to change hardware configuration, e.g., channel.
+ *	This function should never fail but returns a negative error code
+ *	if it does. The callback can sleep.
+ *
+ * @bss_info_changed: Handler for configuration requests related to BSS
+ *	parameters that may vary during BSS's lifespan, and may affect low
+ *	level driver (e.g. assoc/disassoc status, erp parameters).
+ *	This function should not be used if no BSS has been set, unless
+ *	for association indication. The @changed parameter indicates which
+ *	of the bss parameters has changed when a call is made. The callback
+ *	can sleep.
+ *
+ * @conf_tx: Configure TX queue parameters (EDCF (aifs, cw_min, cw_max),
+ *	bursting) for a hardware TX queue.
+ *	Returns a negative error code on failure.
+ *	The callback can sleep.
+ *
+ * @prepare_multicast: Prepare for multicast filter configuration.
+ *	This callback is optional, and its return value is passed
+ *	to configure_filter(). This callback must be atomic.
+ *
+ * @configure_filter: Configure the device's RX filter.
+ *	See the section "Frame filtering" for more information.
+ *	This callback must be implemented and can sleep.
+ *
+ * @get_tsf: Get the current TSF timer value from firmware/hardware. Currently,
+ *	this is only used for IBSS mode BSSID merging and debugging. Is not a
+ *	required function.
+ *	The callback can sleep.
+ */
+static const struct ieee80211_ops rtl8180_ops = {
+	.tx			= rtl8180_tx,
+	.start			= rtl8180_start,
+	.stop			= rtl8180_stop,
+	.add_interface		= rtl8180_add_interface,
+	.remove_interface	= rtl8180_remove_interface,
+	.config			= rtl8180_config,
+	.bss_info_changed	= rtl8180_bss_info_changed,
+	.conf_tx		= rtl8180_conf_tx,
+	.prepare_multicast	= rtl8180_prepare_multicast,
+	.configure_filter	= rtl8180_configure_filter,
+	.get_tsf		= rtl8180_get_tsf,	
+};
+static void rtl8180_eeprom_register_read(struct eeprom_93cx6 *eeprom)
+{
+	struct rtl8180_priv *priv = eeprom->data;
+	u8 reg = rtl818x_ioread8(priv, &priv->map->EEPROM_CMD);
+
+	eeprom->reg_data_in = reg & RTL818X_EEPROM_CMD_WRITE;
+	eeprom->reg_data_out = reg & RTL818X_EEPROM_CMD_READ;
+	eeprom->reg_data_clock = reg & RTL818X_EEPROM_CMD_CK;
+	eeprom->reg_chip_select = reg & RTL818X_EEPROM_CMD_CS;
+}
+
+static void rtl8180_eeprom_register_write(struct eeprom_93cx6 *eeprom)
+{
+	struct rtl8180_priv *priv = eeprom->data;
+	u8 reg = 2 << 6;
+
+	if (eeprom->reg_data_in)
+		reg |= RTL818X_EEPROM_CMD_WRITE;
+	if (eeprom->reg_data_out)
+		reg |= RTL818X_EEPROM_CMD_READ;
+	if (eeprom->reg_data_clock)
+		reg |= RTL818X_EEPROM_CMD_CK;
+	if (eeprom->reg_chip_select)
+		reg |= RTL818X_EEPROM_CMD_CS;
+
+	rtl818x_iowrite8(priv, &priv->map->EEPROM_CMD, reg);
+	rtl818x_ioread8(priv, &priv->map->EEPROM_CMD);
+	udelay(10);
+}
+
+/**
  * eeprom_93cx6_read - Read a word from eeprom
  * @eeprom: Pointer to eeprom structure
  * @word: Word index from where we should start reading
@@ -59,8 +184,8 @@ static void rtl8180_eeprom_read(struct rtl8180_priv *priv)
 	int i;
 
 	eeprom.data = priv;
-	eeprom.register_read = rtl8180_eeprom_register_read; //TODO
-	eeprom.register_write = rtl8180_eeprom_register_write; //TODO
+	eeprom.register_read = rtl8180_eeprom_register_read; //TODO : Done
+	eeprom.register_write = rtl8180_eeprom_register_write; //TODO : Done
 	if (rtl818x_ioread32(priv, &priv->map->RX_CONF) & (1 << 6)) // page 23
 		eeprom.width = PCI_EEPROM_WIDTH_93C66;
 	else 
