@@ -20,6 +20,19 @@
 
 #include "rtl8180.h"
 
+static void rtl8180_bss_info_changed(struct ieee80211_hw *dev,
+				     struct ieee80211_vif *vif,
+				     struct ieee80211_bss_conf *info,
+				     u32 changed)
+{
+	struct rtl8180_priv *priv = dev->priv;
+	struct rtl8180_vif *vif_priv;
+	int i;
+	u8 reg;
+
+	vif_priv = (struct rtl8180_vif *)&vif->drv_priv;
+
+}
 
 static const struct pci_device_id rtl8180_table[] = {
 	{ PCI_DEVICE(PCI_VENDOR_ID_REALTEK, 0x8199) },
@@ -29,6 +42,130 @@ static const struct pci_device_id rtl8180_table[] = {
 };
 MODULE_DEVICE_TABLE(pci, rtl8180_table);
 
+/**
+ * ieee80211_generic_frame_duration - Calculate the duration field for a frame
+ * @hw: pointer obtained from ieee80211_alloc_hw().
+ * @vif: &struct ieee80211_vif pointer from the add_interface callback.
+ * @band: the band to calculate the frame duration on
+ * @frame_len: the length of the frame.
+ * @rate: the rate at which the frame is going to be transmitted.
+ *
+ * Calculate the duration field of some generic frame, given its
+ * length and transmission rate (in 100kbps).
+ *
+ * Return: The duration.
+ */
+static void rtl8180_bss_info_changed(struct ieee80211_hw *dev,
+				     struct ieee80211_vif *vif,
+				     struct ieee80211_bss_conf *info,
+				     u32 changed)
+{
+	struct rtl8180_priv *priv = dev->priv;
+	struct rtl8180_vif *vif_priv;
+	int i;
+	u8 reg;
+
+	vif_priv = (struct rtl8180_vif *)&vif->drv_priv;
+
+	/* @BSS_CHANGED_BSSID: BSSID changed, for whatever
+ 	 * reason (IBSS and managed mode)
+ 	 */
+	
+	if (changed & BSS_CHANGED_BSSID) {
+		rtl818x_iowrite16(priv, (__le16 __iomem *)&priv->map->BSSID[0],
+				  le16_to_cpu(*(__le16 *)info->bssid));
+		rtl818x_iowrite32(priv, (__le32 __iomem *)&priv->map->BSSID[2],
+				  le32_to_cpu(*(__le32 *)(info->bssid + 2)));
+		
+		if (is_valid_ether_addr(info->bssid)) {
+			if (vif->type == NL80211_IFTYPE_ADHOC) //independent BSS member
+				reg = RTL818X_MSR_ADHOC;
+			else
+				reg = RTL818X_MSR_INFRA;
+		} else
+			reg = RTL818X_MSR_NO_LINK;
+
+		if (priv->chip_family == RTL818X_CHIP_FAMILY_RTL8187SE)
+			reg |= RTL818X_MSR_ENEDCA;
+
+		rtl818x_iowrite8(priv, &priv->map->MSR, reg);
+	}
+
+	if (changed & BSS_CHANGED_BASIC_RATES)  //Basic rateset changed
+		rtl8180_conf_basic_rates(dev, info->basic_rates);
+	/* Slot timing changed $ preamble changed */
+	if (changed & (BSS_CHANGED_ERP_SLOT | BSS_CHANGED_ERP_PREAMBLE)) {  
+
+		/* when preamble changes, acktime duration changes, and erp must
+		 * be recalculated. ACK time is calculated at lowest rate.
+		 * Since mac80211 include SIFS time we remove it (-10)
+		 */
+		priv->ack_time =
+			le16_to_cpu(ieee80211_generic_frame_duration(dev,
+					priv->vif,
+					NL80211_BAND_2GHZ, 10,
+					&priv->rates[0])) - 10;
+
+		rtl8180_conf_erp(dev, info); //TODO:
+
+		/* mac80211 supplies aifs_n to driver and calls
+		 * conf_tx callback whether aifs_n changes, NOT
+		 * when aifs changes.
+		 * Aifs should be recalculated if slot changes.
+		 */
+		if (priv->chip_family == RTL818X_CHIP_FAMILY_RTL8187SE) {
+			for (i = 0; i < 4; i++)
+				rtl8187se_conf_ac_parm(dev, i); //TODO
+		}
+	}
+	/* Beaconing should be ENABLED/Desabled */	
+	if (changed & BSS_CHANGED_BEACON_ENABLED)
+		vif_priv->enable_beacon = info->enable_beacon;
+
+	/* Beacon data changed, retrieve */
+	if (changed & (BSS_CHANGED_BEACON_ENABLED | BSS_CHANGED_BEACON)) {
+		/* Cancel a delayed work and wait for it to finish : ?? TODO*/
+		cancel_delayed_work_sync(&vif_priv->beacon_work);
+		if (vif_priv->enable_beacon)
+			schedule_work(&vif_priv->beacon_work.work);
+	}
+			
+}
+
+static u64 rtl8180_prepare_multicast(struct ieee80211_hw *dev,
+				     struct netdev_hw_addr_list *mc_list)
+{
+	return netdev_hw_addr_list_count(mc_list);
+}
+
+static void rtl8180_configure_filter(struct ieee80211_hw *dev,
+				     unsigned int changed_flags,
+				     unsigned int *total_flags,
+				     u64 multicast)
+{
+	struct rtl8180_priv *priv = dev->priv;
+	
+	if (changed_flags & FIF_FCSFAIL)
+		priv->rx_conf ^= RTL818X_RX_CONF_FCS;	
+	if (changed_flags & FIF_CONTROL)
+		priv->rx_conf ^= RTL818X_RX_CONF_CTRL;
+	if (changed_flags & FIF_OTHER_BSS)
+		priv->rx_conf ^= RTL818X_RX_CONF_MONITOR;
+	if (*total_flags & FIF_ALLMULTI || multicast > 0)
+		priv->rx_conf |= RTL818X_RX_CONF_MULTICAST;
+	else
+		priv->rx_conf &= ~RTL818X_RX_CONF_MULTICAST;
+	
+	if (priv->rx_conf & RTL818X_RX_CONF_FCS)
+		*total_flags |= FIF_FCSFAIL;
+	if (priv->rx_conf & RTL818X_RX_CONF_CTRL)
+		*total_flags |= FIF_CONTROL;
+	if (priv->rx_conf & RTL818X_RX_CONF_MONITOR)
+		*total_flags |= FIF_OTHER_BSS;
+	if (priv->rx_conf & RTL818X_RX_CONF_MULTICAST)
+		*total_flags |= FIF_ALLMULTI;
+	rtl818x_iowrite32(priv, &priv->map->RX_CONF, priv->rx_conf);
+}
 /**
  * struct ieee80211_ops - callbacks from mac80211 to the driver
  *
