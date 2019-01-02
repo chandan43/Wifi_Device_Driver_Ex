@@ -20,19 +20,6 @@
 
 #include "rtl8180.h"
 
-static void rtl8180_bss_info_changed(struct ieee80211_hw *dev,
-				     struct ieee80211_vif *vif,
-				     struct ieee80211_bss_conf *info,
-				     u32 changed)
-{
-	struct rtl8180_priv *priv = dev->priv;
-	struct rtl8180_vif *vif_priv;
-	int i;
-	u8 reg;
-
-	vif_priv = (struct rtl8180_vif *)&vif->drv_priv;
-
-}
 
 static const struct pci_device_id rtl8180_table[] = {
 	{ PCI_DEVICE(PCI_VENDOR_ID_REALTEK, 0x8199) },
@@ -42,6 +29,36 @@ static const struct pci_device_id rtl8180_table[] = {
 };
 MODULE_DEVICE_TABLE(pci, rtl8180_table);
 
+static int rtl8180_conf_tx(struct ieee80211_hw *dev,
+			    struct ieee80211_vif *vif, u16 queue,
+			    const struct ieee80211_tx_queue_params *params)
+{
+	struct rtl8180_priv *priv = dev->priv;
+	u8 cw_min, cw_max;
+	if (priv->chip_name == RTL818X_CHIP_FAMILY_RTL8180)
+		return;
+
+	/* find last set bit in word */
+	cw_min = fls(params->cw_min);
+	cw_max = fls(params->cw_max);
+
+	if (priv->chip_family == RTL818X_CHIP_FAMILY_RTL8187SE) {
+		priv->queue_param[queue] = *params;
+		rtl8187se_conf_ac_parm(dev, queue);
+	} else 
+		rtl818x_iowrite8(priv, &priv->map->CW_VAL,
+						 (cw_max << 4) | cw_min);
+	return 0;
+}
+
+
+static void rtl8180_conf_erp(struct ieee80211_hw *dev,
+			    struct ieee80211_bss_conf *info)
+{
+	struct rtl8180_priv *priv = dev->priv;
+	if (priv->chip_name == RTL818X_CHIP_FAMILY_RTL8180)
+		return;
+}		    	
 /**
  * ieee80211_generic_frame_duration - Calculate the duration field for a frame
  * @hw: pointer obtained from ieee80211_alloc_hw().
