@@ -29,6 +29,164 @@ static const struct pci_device_id rtl8180_table[] = {
 };
 MODULE_DEVICE_TABLE(pci, rtl8180_table);
 
+/**
+ * container_of - cast a member of a structure out to the containing structure
+ *
+ * @ptr:	the pointer to the member.
+ * @type:       the type of the container struct this is embedded in.
+ * @member:     the name of the member within the struct.
+ *
+ */
+/**
+ * ieee80211_queue_stopped - test status of the queue
+ * @hw: pointer as obtained from ieee80211_alloc_hw().
+ * @queue: queue number (counted from zero).
+ *
+ * Drivers should use this function instead of netif_stop_queue.
+ *
+ * Return: %true if the queue is stopped. %false otherwise.
+ */
+//TODO
+static void rtl8180_beacon_work(struct work_struct *work)
+{
+	struct rtl8180_vif *vif_priv =
+		container_of(work, struct rtl8180_vif, beacon_work.work);
+	struct ieee80211_vif *vif =
+		container_of((void *)vif_priv, struct ieee80211_vif, drv_priv);
+	struct ieee80211_hw *dev = vif_priv->dev;
+	struct ieee80211_mgmt *mgmt;
+	struct sk_buff *skb;
+	
+	/* don't overflow the tx ring */
+	if (ieee80211_queue_stopped(dev, 0)) //TODO
+		goto resched;
+
+	/* grab a fresh beacon */
+	skb = ieee80211_beacon_get(dev, vif);
+	if (!skb)
+		goto resched;
+
+	/*
+	 * update beacon timestamp w/ TSF value
+	 * TODO: make hardware update beacon timestamp
+	 */
+	mgmt = (struct ieee80211_mgmt *)skb->data;
+	mgmt->u.beacon.timestamp = cpu_to_le64(rtl8180_get_tsf(dev, vif));
+
+	/* TODO: use actual beacon queue */
+	skb_set_queue_mapping(skb, 0);
+
+	rtl8180_tx(dev, NULL, skb);
+
+resched:
+	/*
+	 * schedule next beacon
+	 * TODO: use hardware support for beacon timing
+	 */
+	schedule_delayed_work(&vif_priv->beacon_work,
+			usecs_to_jiffies(1024 * vif->bss_conf.beacon_int));
+
+}
+static int rtl8180_add_interface(struct ieee80211_hw *dev,
+				 struct ieee80211_vif *vif)
+{
+	struct rtl8180_priv *priv = dev->priv;
+	struct rtl8180_vif *vif_priv;
+
+	/*
+	 * We only support one active interface at a time.
+	 */
+	if (priv->vif)
+		return -EBUSY;
+	
+	switch (vif->type) {
+	/*Managed BSS member*/
+	case NL80211_IFTYPE_STATION:
+	case NL80211_IFTYPE_ADHOC:
+		break;
+	default:
+		return -EOPNOTSUPP;
+	}		
+	priv->vif = vif;
+	/* Initialize driver private area */
+	vif_priv = (struct rtl8180_vif *)&vif->drv_priv;
+	vif_priv->dev = dev;
+	INIT_DELAYED_WORK(&vif_priv->beacon_work, rtl8180_beacon_work); //TODO
+	vif_priv->enable_beacon = false;
+	
+	rtl818x_iowrite8(priv, &priv->map->EEPROM_CMD, RTL818X_EEPROM_CMD_CONFIG);
+	rtl818x_iowrite32(priv, (__le32 __iomem *)&priv->map->MAC[0],
+			  le32_to_cpu(*(__le32 *)vif->addr));
+	rtl818x_iowrite16(priv, (__le16 __iomem *)&priv->map->MAC[4],
+			  le16_to_cpu(*(__le16 *)(vif->addr + 4)));
+	rtl818x_iowrite8(priv, &priv->map->EEPROM_CMD, RTL818X_EEPROM_CMD_NORMAL);
+
+	return 0;
+}
+
+static void rtl8180_remove_interface(struct ieee80211_hw *dev,
+				     struct ieee80211_vif *vif)
+{
+	struct rtl8180_priv *priv = dev->priv;
+	priv->vif = NULL;
+}
+
+static int rtl8180_config(struct ieee80211_hw *dev, u32 changed)
+{
+	struct rtl8180_priv *priv = dev->priv;
+	struct ieee80211_conf *conf = &dev->conf;
+
+	priv->rf->set_chan(dev, conf);
+
+	return 0;
+}
+
+
+/**
+ * enum ieee80211_ac_numbers - AC numbers as used in mac80211
+ * @IEEE80211_AC_VO: voice
+ * @IEEE80211_AC_VI: video
+ * @IEEE80211_AC_BE: best effort
+ * @IEEE80211_AC_BK: background
+ */
+static void rtl8187se_conf_ac_parm(struct ieee80211_hw *dev, u8 queue)
+{
+	const struct ieee80211_tx_queue_params *params;
+	struct rtl8180_priv *priv = dev->priv;
+
+	/* hw value */
+	u32 ac_param;
+	u8 aifs;
+	u8 txop;
+	u8 cw_min, cw_max;
+
+	params = &priv->queue_param[queue];
+	cw_min = fls(params->cw_min);
+	cw_max = fls(params->cw_max);
+
+	aifs = 10 + params->aifs * priv->slot_time;
+	/* TODO: check if txop HW is in us (mult by 32) */
+	txop = params->txop;
+	ac_param = txop << AC_PARAM_TXOP_LIMIT_SHIFT |
+		cw_max << AC_PARAM_ECW_MAX_SHIFT |
+		cw_min << AC_PARAM_ECW_MIN_SHIFT |
+		aifs << AC_PARAM_AIFS_SHIFT;
+	switch (queue) {
+	case IEEE80211_AC_BK:
+		rtl818x_iowrite32(priv, &priv->map->AC_BK_PARAM, ac_param);
+		break;
+	case IEEE80211_AC_BE:
+		rtl818x_iowrite32(priv, &priv->map->AC_BE_PARAM, ac_param);
+		break;
+	case IEEE80211_AC_VI:
+		rtl818x_iowrite32(priv, &priv->map->AC_VI_PARAM, ac_param);
+		break;
+	case IEEE80211_AC_VO:
+		rtl818x_iowrite32(priv, &priv->map->AC_VO_PARAM, ac_param);
+		break;
+	}	
+}	
+
 static int rtl8180_conf_tx(struct ieee80211_hw *dev,
 			    struct ieee80211_vif *vif, u16 queue,
 			    const struct ieee80211_tx_queue_params *params)
@@ -58,6 +216,30 @@ static void rtl8180_conf_erp(struct ieee80211_hw *dev,
 	struct rtl8180_priv *priv = dev->priv;
 	if (priv->chip_name == RTL818X_CHIP_FAMILY_RTL8180)
 		return;
+	/* I _hope_ this means 10uS for the HW.
+	 * In reference code it is 0x22 for
+	 * both rtl8187L and rtl8187SE
+	 */
+	sifs = 0x22;
+	if (info->use_short_slot)
+		priv->slot_time = 9;
+	else
+		priv->slot_time = 20;
+
+	/* from reference code. set ack timeout reg = eifs reg */
+	rtl818x_iowrite8(priv, &priv->map->CARRIER_SENSE_COUNTER, hw_eifs);
+
+	if (priv->chip_family == RTL818X_CHIP_FAMILY_RTL8187SE)
+		rtl818x_iowrite8(priv, &priv->map->EIFS_8187SE, hw_eifs);
+	else if (priv->chip_family == RTL818X_CHIP_FAMILY_RTL8185) {
+		/* rtl8187/rtl8185 HW bug. After EIFS is elapsed,
+		 * the HW still wait for DIFS.
+		 * HW uses 4uS units for EIFS.
+		 */
+		hw_eifs = DIV_ROUND_UP(eifs - difs, 4);
+
+		rtl818x_iowrite8(priv, &priv->map->EIFS, hw_eifs);
+	}
 }		    	
 /**
  * ieee80211_generic_frame_duration - Calculate the duration field for a frame
