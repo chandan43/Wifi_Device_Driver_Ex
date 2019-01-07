@@ -29,6 +29,42 @@ static const struct pci_device_id rtl8180_table[] = {
 };
 MODULE_DEVICE_TABLE(pci, rtl8180_table);
 
+static void rtl8180_stop(struct ieee80211_hw *dev)
+{
+	struct rtl8180_priv *priv = dev->priv;
+	u8 reg;
+	int i;
+	
+	rtl8180_int_disable(dev); //TODO
+	
+	reg = rtl818x_ioread8(priv, &priv->map->CMD);
+	reg &= ~RTL818X_CMD_TX_ENABLE;
+	reg &= ~RTL818X_CMD_RX_ENABLE;
+	rtl818x_iowrite8(priv, &priv->map->CMD, reg);
+
+	priv->rf->stop(dev);
+
+	rtl818x_iowrite8(priv, &priv->map->EEPROM_CMD, RTL818X_EEPROM_CMD_CONFIG);
+	reg = rtl818x_ioread8(priv, &priv->map->CONFIG4);
+	rtl818x_iowrite8(priv, &priv->map->CONFIG4, reg | RTL818X_CONFIG4_VCOOFF);
+	rtl818x_iowrite8(priv, &priv->map->EEPROM_CMD, RTL818X_EEPROM_CMD_NORMAL);
+
+	free_irq(priv->pdev->irq, dev);
+
+	rtl8180_free_rx_ring(dev); //TODO
+	for (i = 0; i < (dev->queues + 1); i++)
+		rtl8180_free_tx_ring(dev, i); //TODO		
+}
+
+static u64 rtl8180_get_tsf(struct ieee80211_hw *dev,
+			   struct ieee80211_vif *vif)
+{
+	struct rtl8180_priv *priv = dev->priv;
+
+	return rtl818x_ioread32(priv, &priv->map->TSFT[0]) |
+	       (u64)(rtl818x_ioread32(priv, &priv->map->TSFT[1])) << 32;
+}
+
 /**
  * container_of - cast a member of a structure out to the containing structure
  *
