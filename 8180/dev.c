@@ -29,6 +29,137 @@ static const struct pci_device_id rtl8180_table[] = {
 };
 MODULE_DEVICE_TABLE(pci, rtl8180_table);
 
+/*
+ * This function creates a split out lock class for each invocation;
+ * this is needed for now since a whole lot of users of the skb-queue
+ * infrastructure in drivers have different locking usage (in hardirq)
+ * than the networking core (in softirq only). In the long run either the
+ * network layer or drivers should need annotation to consolidate the
+ * main types of usage into 3 classes.
+ */
+static int rtl8180_start(struct ieee80211_hw *dev)
+{
+	struct rtl8180_priv *priv = dev->priv;
+	int ret, i;
+	u32 reg;
+	
+	ret = rtl8180_init_rx_ring(dev); //TODO:
+	if (ret)
+		return ret;
+	for (i = 0; i < (dev->queues + 1); i++)
+		if ((ret = rtl8180_init_tx_ring(dev, i, 16))) //TODO
+			goto err_free_rings;
+
+	ret = rtl8180_init_hw(dev);
+	if (ret)
+		goto err_free_rings;
+	
+	if (priv->chip_family == RTL818X_CHIP_FAMILY_RTL8187SE) {
+		ret = request_irq(priv->pdev->irq, rtl8187se_interrupt,
+			  IRQF_SHARED, KBUILD_MODNAME, dev);
+	} else {
+		ret = request_irq(priv->pdev->irq, rtl8180_interrupt,
+			  IRQF_SHARED, KBUILD_MODNAME, dev);
+	}
+	
+	if (ret) {
+		wiphy_err(dev->wiphy, "failed to register IRQ handler\n");
+		goto err_free_rings;
+	}
+
+	rtl8180_int_enable(dev); //TODO
+	/* in rtl8187se at MAR regs offset there is the management
+	 * TX descriptor DMA addres..
+	 */
+	if (priv->chip_family != RTL818X_CHIP_FAMILY_RTL8187SE) {
+		rtl818x_iowrite32(priv, &priv->map->MAR[0], ~0);
+		rtl818x_iowrite32(priv, &priv->map->MAR[1], ~0);
+	}
+	
+	reg = RTL818X_RX_CONF_ONLYERLPKT |
+	      RTL818X_RX_CONF_RX_AUTORESETPHY |
+	      RTL818X_RX_CONF_MGMT |
+	      RTL818X_RX_CONF_DATA |
+	      (7 << 8 /* MAX RX DMA */) |
+	      RTL818X_RX_CONF_BROADCAST |
+	      RTL818X_RX_CONF_NICMAC;
+
+	if (priv->chip_family == RTL818X_CHIP_FAMILY_RTL8185)
+		reg |= RTL818X_RX_CONF_CSDM1 | RTL818X_RX_CONF_CSDM2;
+	else if (priv->chip_family == RTL818X_CHIP_FAMILY_RTL8180) {
+		reg |= (priv->rfparam & RF_PARAM_CARRIERSENSE1)
+			? RTL818X_RX_CONF_CSDM1 : 0;
+		reg |= (priv->rfparam & RF_PARAM_CARRIERSENSE2)
+			? RTL818X_RX_CONF_CSDM2 : 0;
+	} else {
+		reg &= ~(RTL818X_RX_CONF_CSDM1 | RTL818X_RX_CONF_CSDM2);
+	}
+
+	priv->rx_conf = reg;
+	rtl818x_iowrite32(priv, &priv->map->RX_CONF, reg);
+	if (priv->chip_family != RTL818X_CHIP_FAMILY_RTL8180) {
+		reg = rtl818x_ioread8(priv, &priv->map->CW_CONF);
+
+		/* CW is not on per-packet basis.
+		 * in rtl8185 the CW_VALUE reg is used.
+		 * in rtl8187se the AC param regs are used.
+		 */
+		reg &= ~RTL818X_CW_CONF_PERPACKET_CW;
+		/* retry limit IS on per-packet basis.
+		 * the short and long retry limit in TX_CONF
+		 * reg are ignored
+		 */
+		reg |= RTL818X_CW_CONF_PERPACKET_RETRY;
+		rtl818x_iowrite8(priv, &priv->map->CW_CONF, reg);
+
+		reg = rtl818x_ioread8(priv, &priv->map->TX_AGC_CTL);
+		/* TX antenna and TX gain are not on per-packet basis.
+		 * TX Antenna is selected by ANTSEL reg (RX in BB regs).
+		 * TX gain is selected with CCK_TX_AGC and OFDM_TX_AGC regs
+		 */
+		reg &= ~RTL818X_TX_AGC_CTL_PERPACKET_GAIN;
+		reg &= ~RTL818X_TX_AGC_CTL_PERPACKET_ANTSEL;
+		reg |=  RTL818X_TX_AGC_CTL_FEEDBACK_ANT;
+		rtl818x_iowrite8(priv, &priv->map->TX_AGC_CTL, reg);
+
+		/* disable early TX */
+		rtl818x_iowrite8(priv, (u8 __iomem *)priv->map + 0xec, 0x3f);
+	}
+	reg = rtl818x_ioread32(priv, &priv->map->TX_CONF);
+	reg |= (6 << 21 /* MAX TX DMA */) |
+	       RTL818X_TX_CONF_NO_ICV;
+
+	if (priv->chip_family == RTL818X_CHIP_FAMILY_RTL8187SE)
+		reg |= 1<<30;  /*  "duration procedure mode" */
+
+	if (priv->chip_family != RTL818X_CHIP_FAMILY_RTL8180)
+		reg &= ~RTL818X_TX_CONF_PROBE_DTS;
+	else
+		reg &= ~RTL818X_TX_CONF_HW_SEQNUM;
+
+	reg &= ~RTL818X_TX_CONF_DISCW;
+	
+	/* different meaning, same value on both rtl8185 and rtl8180 */
+	reg &= ~RTL818X_TX_CONF_SAT_HWPLCP;
+
+	rtl818x_iowrite32(priv, &priv->map->TX_CONF, reg);
+
+	reg = rtl818x_ioread8(priv, &priv->map->CMD);
+	reg |= RTL818X_CMD_RX_ENABLE;
+	reg |= RTL818X_CMD_TX_ENABLE;
+	rtl818x_iowrite8(priv, &priv->map->CMD, reg);
+
+	return 0;
+
+err_free_rings:
+	rtl8180_free_rx_ring(dev); //TODO
+	for (i = 0; i < (dev->queues + 1); i++)
+		if (priv->tx_ring[i].desc)
+			rtl8180_free_tx_ring(dev, i);
+
+	return ret;	
+}
+
 static void rtl8180_stop(struct ieee80211_hw *dev)
 {
 	struct rtl8180_priv *priv = dev->priv;
