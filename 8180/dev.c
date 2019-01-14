@@ -29,6 +29,143 @@ static const struct pci_device_id rtl8180_table[] = {
 };
 MODULE_DEVICE_TABLE(pci, rtl8180_table);
 
+static int rtl8180_init_rx_ring(struct ieee80211_hw *dev)
+{
+	struct rtl8180_priv *priv = dev->priv;
+	struct rtl818x_rx_cmd_desc *entry;
+	int i;
+	
+	if (priv->chip_family == RTL818X_CHIP_FAMILY_RTL8187SE)
+		priv->rx_ring_sz = sizeof(struct rtl8187se_rx_desc);
+	else
+		priv->rx_ring_sz = sizeof(struct rtl8180_rx_desc);
+
+	priv->rx_ring = pci_zalloc_consistent(priv->pdev, priv->rx_ring_sz * 32,
+					      &priv->rx_ring_dma);
+
+	if (!priv->rx_ring || (unsigned long)priv->rx_ring & 0xFF) {
+		wiphy_err(dev->wiphy, "Cannot allocate RX ring\n");
+		return -ENOMEM;
+	}
+
+	priv->rx_idx = 0;	
+	/* legacy helper around netdev_alloc_skb() */
+	for (i = 0; i < 32; i++) {
+		struct sk_buff *skb = dev_alloc_skb(MAX_RX_SIZE);
+		dma_addr_t *mapping;
+		entry = priv->rx_ring + priv->rx_ring_sz*i;
+		if (!skb) {
+			pci_free_consistent(priv->pdev, priv->rx_ring_sz * 32,
+					priv->rx_ring, priv->rx_ring_dma);
+			wiphy_err(dev->wiphy, "Cannot allocate RX skb\n");
+			return -ENOMEM;
+		}
+		priv->rx_buf[i] = skb;
+		mapping = (dma_addr_t *)skb->cb;
+		*mapping = pci_map_single(priv->pdev, skb_tail_pointer(skb),
+					  MAX_RX_SIZE, PCI_DMA_FROMDEVICE);
+
+		if (pci_dma_mapping_error(priv->pdev, *mapping)) {
+			kfree_skb(skb);
+			pci_free_consistent(priv->pdev, priv->rx_ring_sz * 32,
+					priv->rx_ring, priv->rx_ring_dma);
+			wiphy_err(dev->wiphy, "Cannot map DMA for RX skb\n");
+			return -ENOMEM;
+		}
+
+		entry->rx_buf = cpu_to_le32(*mapping);
+		entry->flags = cpu_to_le32(RTL818X_RX_DESC_FLAG_OWN |
+					   MAX_RX_SIZE);
+	}
+	entry->flags |= cpu_to_le32(RTL818X_RX_DESC_FLAG_EOR);
+	return 0;	
+}
+static void rtl8180_free_rx_ring(struct ieee80211_hw *dev)
+{
+	struct rtl8180_priv *priv = dev->priv;
+	int i;
+
+	for (i = 0; i < 32; i++) {
+		struct sk_buff *skb = priv->rx_buf[i];
+		if (!skb)
+			continue;
+
+		pci_unmap_single(priv->pdev,
+				 *((dma_addr_t *)skb->cb),
+				 MAX_RX_SIZE, PCI_DMA_FROMDEVICE);
+		kfree_skb(skb);
+	}
+
+	pci_free_consistent(priv->pdev, priv->rx_ring_sz * 32,
+			    priv->rx_ring, priv->rx_ring_dma);
+	priv->rx_ring = NULL;
+}
+
+/*
+ * This function creates a split out lock class for each invocation;
+ * this is needed for now since a whole lot of users of the skb-queue
+ * infrastructure in drivers have different locking usage (in hardirq)
+ * than the networking core (in softirq only). In the long run either the
+ * network layer or drivers should need annotation to consolidate the
+ * main types of usage into 3 classes.
+ */
+static int rtl8180_init_tx_ring(struct ieee80211_hw *dev,
+				unsigned int prio, unsigned int entries)
+{
+	struct rtl8180_priv *priv = dev->priv;
+	struct rtl8180_tx_desc *ring;
+	dma_addr_t dma;
+	int i;
+
+	/* DMA cohrent buffer allocation */
+	ring = pci_zalloc_consistent(priv->pdev, sizeof(*ring) * entries,
+				     &dma);
+	if (!ring || (unsigned long)ring & 0xFF) {
+		wiphy_err(dev->wiphy, "Cannot allocate TX ring (prio = %d)\n",
+			  prio);
+		return -ENOMEM;
+	}
+
+	priv->tx_ring[prio].desc = ring;
+	priv->tx_ring[prio].dma = dma;
+	priv->tx_ring[prio].idx = 0;
+	priv->tx_ring[prio].entries = entries;
+	skb_queue_head_init(&priv->tx_ring[prio].queue);
+
+	for (i = 0; i < entries; i++)
+		ring[i].next_tx_desc =
+			cpu_to_le32((u32)dma + ((i + 1) % entries) * sizeof(*ring));
+
+	return 0;
+}
+
+/**
+ *	__skb_dequeue - remove from the head of the queue
+ *	@list: list to dequeue from
+ *
+ *	Remove the head of the list. This function does not take any locks
+ *	so must be used with appropriate locks held only. The head item is
+ *	returned or %NULL if the list is empty.
+ */
+static void rtl8180_free_tx_ring(struct ieee80211_hw *dev, unsigned int prio)
+{
+	struct rtl8180_priv *priv = dev->priv;
+	struct rtl8180_tx_ring *ring = &priv->tx_ring[prio];
+
+	while (skb_queue_len(&ring->queue)) {
+		struct rtl8180_tx_desc *entry = &ring->desc[ring->idx];
+		struct sk_buff *skb = __skb_dequeue(&ring->queue);
+
+		pci_unmap_single(priv->pdev, le32_to_cpu(entry->tx_buf),
+				 skb->len, PCI_DMA_TODEVICE);
+		kfree_skb(skb);
+		ring->idx = (ring->idx + 1) % ring->entries;
+	}
+
+	pci_free_consistent(priv->pdev, sizeof(*ring->desc)*ring->entries,
+			    ring->desc, ring->dma);
+	ring->desc = NULL;
+}
 /*
  * This function creates a split out lock class for each invocation;
  * this is needed for now since a whole lot of users of the skb-queue
@@ -89,6 +226,30 @@ static int rtl8180_start(struct ieee80211_hw *dev)
 	else if (priv->chip_family == RTL818X_CHIP_FAMILY_RTL8180) {
 		reg |= (priv->rfparam & RF_PARAM_CARRIERSENSE1)
 			? RTL818X_RX_CONF_CSDM1 : 0;
+		reg |= (priv->rfparam & RF_PARAM_CARRIERSENSE2)
+			? RTL818X_RX_CONF_CSDM2 : 0;
+	} else {
+		reg &= ~(RTL818X_RX_CONF_CSDM1 | RTL818X_RX_CONF_CSDM2);
+	}
+
+	priv->rx_conf = reg;
+	rtl818x_iowrite32(priv, &priv->map->RX_CONF, reg);
+	if (priv->chip_family != RTL818X_CHIP_FAMILY_RTL8180) {
+		reg = rtl818x_ioread8(priv, &priv->map->CW_CONF);
+
+		/* CW is not on per-packet basis.
+		 * in rtl8185 the CW_VALUE reg is used.
+		 * in rtl8187se the AC param regs are used.
+		 */
+		reg &= ~RTL818X_CW_CONF_PERPACKET_CW;
+		/* retry limit IS on per-packet basis.
+		 * the short and long retry limit in TX_CONF
+		 * reg are ignored
+		 */
+		reg |= RTL818X_CW_CONF_PERPACKET_RETRY;
+		rtl818x_iowrite8(priv, &priv->map->CW_CONF, reg);
+
+		reg = rtl818x_ioread8(priv, &priv->map->TX_AGC_CTL);
 		reg |= (priv->rfparam & RF_PARAM_CARRIERSENSE2)
 			? RTL818X_RX_CONF_CSDM2 : 0;
 	} else {
@@ -1021,30 +1182,6 @@ static int rtl8180_probe(struct pci_dev *pdev,
 		pr_err("%s (rtl8180): Cannot register device\n",
 		       pci_name(pdev));
 		goto err_iounmap;
-	}
-
-	wiphy_info(dev->wiphy, "hwaddr %pm, %s + %s\n",
-		   priv->mac_addr, chip_name, priv->rf->name);
-
-	return 0;
-err_iounmap:
-	pci_iounmap(pdev, priv->map);
-
-err_free_dev:
-	ieee80211_free_hw(dev);
-
-err_free_reg:
-	pci_release_regions(pdev);
-	
-err_disable_dev:
-	pci_disable_device(pdev);
-	return err;
-}
-
-static void rtl8180_remove(struct pci_dev *pdev)
-{
-	pr_info("%s: Bye Bye driver \n",__func__); // Update soon
-}
 static struct pci_driver rtl8180_driver = {
 	.name 		= KBUILD_MODNAME,
 	.id_table	= rtl8180_table,
